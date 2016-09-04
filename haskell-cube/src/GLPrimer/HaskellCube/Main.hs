@@ -10,7 +10,7 @@ import qualified Data.Text.IO as T
 import qualified Data.Text.Foreign as T
 import qualified Data.Vector as V
 
-import Control.Monad (void, when, unless, liftM2)
+import Control.Monad (void, when, unless, liftM2, (<=<))
 import Control.Applicative ((<$>), (<*>), pure)
 import System.IO (hSetBuffering, stdout, BufferMode(LineBuffering))
 import Data.IORef (IORef, newIORef, writeIORef, readIORef)
@@ -19,7 +19,7 @@ import Data.Bits ((.|.))
 import Control.Monad.Trans.Maybe(MaybeT(..))
 import Control.Monad.Trans.Cont (ContT(..), evalContT)
 import Control.Monad.Trans.Class (lift)
-import Control.Monad.IO.Class (liftIO)
+import Control.Monad.IO.Class (MonadIO(liftIO))
 
 import qualified Data.Vector.Storable as SV
 import Foreign.Marshal.Alloc (alloca, allocaBytes)
@@ -53,6 +53,8 @@ import Graphics.GL
   , GLsizei
   , GLenum
   , GLchar
+  , GLboolean
+  , GLbitfield
   , glActiveTexture
   , glAttachShader
   , glLinkProgram
@@ -140,6 +142,7 @@ import Linear
   ( V2(..)
   , V3(..)
   , M44
+  , M33
   , Quaternion
   , perspective
   , lookAt
@@ -154,7 +157,7 @@ import Linear
   )
 import Data.Distributive (distribute)
 import Control.Lens (view)
-import Codec.Picture (readPng, Image(Image), DynamicImage(ImageRGBA8))
+import Codec.Picture (readPng, Image(Image), DynamicImage(ImageRGBA8), PixelRGBA8)
 
 data Mesh = Mesh
   { _meshVBO :: GLuint
@@ -208,7 +211,7 @@ data DemoState = DemoState
 
 getErrors :: IO [GLuint]
 getErrors = do
-  err <- glGetError
+  err <- getError
   if err == GL_NO_ERROR
      then return []
      else do
@@ -267,7 +270,10 @@ main = do
 
         let swapper = GLFW.swapBuffers win >> GLFW.pollEvents
 
-        initialise >>= runDemo closed projectionMatrix swapper
+        maybeResources <- initialise
+        case maybeResources of
+          Just resources -> runDemo closed projectionMatrix swapper resources
+          Nothing -> return ()
         GLFW.terminate
 
 getDeltaTime :: IO GLfloat
@@ -282,6 +288,7 @@ v3 (x, y, z) = V3 x y z
 cuboid :: GLfloat -> GLfloat -> GLfloat -> MeshSpec
 cuboid l' h' d' = MeshSpec positions colors normals uvs indices
   where
+    l, d, h :: GLfloat
     l = l' * 0.5
     d = d' * 0.5
     h = h' * 0.5
@@ -325,54 +332,55 @@ fromMeshSpec spec = MeshData
   , _indexData = unpackIndices (_specIndices spec)
   }
 
-
-initialise :: IO (Maybe Resources)
-initialise = runMaybeT $ do
-  png <- liftIO $ readPng "data/haskell.png"
-  (Image texWidth texHeight texData) <- MaybeT $ case png of
+readPngAsImageMay :: MonadIO m => FilePath -> m (Maybe (Image PixelRGBA8))
+readPngAsImageMay path = do
+  png <- liftIO (readPng path)
+  case png of
     (Right (ImageRGBA8 i)) -> return $ Just i
     (Left s) -> liftIO (print s) >> return Nothing
     _ -> return Nothing
 
-  textureID <- liftIO . alloca $ \texIDPtr -> do
-    glGenTextures 1 texIDPtr
-    peek texIDPtr
+fillWith :: (MonadIO m, SV.Storable a) => (Ptr a -> IO b) -> m a
+fillWith f = liftIO . alloca $ liftM2 (>>) f peek
 
-  let fillWith f = liftIO . alloca $ liftM2 (>>) f peek
+peekAlloc :: (MonadIO m, SV.Storable a) => (Ptr a -> IO ()) -> m a
+peekAlloc f = liftIO . alloca $ \ptr -> do
+    f ptr
+    peek ptr
 
-  glBindTexture GL_TEXTURE_2D textureID
+initialise :: IO (Maybe Resources)
+initialise = runMaybeT $ do
+  (Image texWidth texHeight texData) <- MaybeT $ readPngAsImageMay "data/haskell.png"
+
+  textureID <- peekAlloc (glGenTextures 1)
+
+  bindTexture GL_TEXTURE_2D textureID
   let (w, h) = (fromIntegral texWidth, fromIntegral texHeight)
 
-  liftIO . SV.unsafeWith texData $ glTexImage2D GL_TEXTURE_2D 0 GL_RGBA w h 0 GL_RGBA GL_UNSIGNED_BYTE . castPtr
+  liftIO . SV.unsafeWith texData $ texImage2D GL_TEXTURE_2D 0 GL_RGBA w h 0 GL_RGBA GL_UNSIGNED_BYTE . castPtr
 
-  glTexParameteri GL_TEXTURE_2D GL_TEXTURE_MAG_FILTER GL_LINEAR
-  glTexParameteri GL_TEXTURE_2D GL_TEXTURE_MIN_FILTER GL_LINEAR
-  glTexParameteri GL_TEXTURE_2D GL_TEXTURE_WRAP_S GL_CLAMP_TO_EDGE
-  glTexParameteri GL_TEXTURE_2D GL_TEXTURE_WRAP_T GL_CLAMP_TO_EDGE
+  texParameteri GL_TEXTURE_2D GL_TEXTURE_MAG_FILTER GL_LINEAR
+  texParameteri GL_TEXTURE_2D GL_TEXTURE_MIN_FILTER GL_LINEAR
+  texParameteri GL_TEXTURE_2D GL_TEXTURE_WRAP_S GL_CLAMP_TO_EDGE
+  texParameteri GL_TEXTURE_2D GL_TEXTURE_WRAP_T GL_CLAMP_TO_EDGE
 
   let loadAndCompileShader :: GLenum -> FilePath -> IO (Maybe GLuint)
       loadAndCompileShader shaderType filename = do
-
-        shaderID <- glCreateShader shaderType
+        shaderID <- createShader shaderType
 
         shaderCode <- T.readFile filename
         T.withCStringLen shaderCode $
           \(str, len) -> with str $
             \strPtr -> with (fromIntegral len) $
-              \lenPtr -> glShaderSource shaderID 1 strPtr lenPtr
+              \lenPtr -> shaderSource shaderID 1 strPtr lenPtr
 
-        glCompileShader shaderID
-        compileStatus <- fillWith $
-          glGetShaderiv shaderID GL_COMPILE_STATUS
+        compileShader shaderID
+        compileStatus <- getShaderiv shaderID GL_COMPILE_STATUS
 
         when (compileStatus == GL_FALSE) $ do
-          infoLogLength <- fillWith $
-            glGetShaderiv shaderID GL_INFO_LOG_LENGTH
+          infoLogLength <- getShaderiv shaderID GL_INFO_LOG_LENGTH
           let infoLogLength' = fromIntegral infoLogLength
-          allocaBytes infoLogLength' $ \infoBuffer -> do
-              glGetShaderInfoLog   shaderID infoLogLength
-                                   nullPtr infoBuffer
-              T.putStr =<<   T.peekCStringLen (infoBuffer, infoLogLength')
+          getShaderInfoLog shaderID infoLogLength nullPtr (T.putStr <=< T.peekCStringLen)
 
         return $ if compileStatus == GL_TRUE
           then Just shaderID
@@ -381,25 +389,20 @@ initialise = runMaybeT $ do
   vs <- MaybeT $ loadAndCompileShader GL_VERTEX_SHADER "data/vertexShader.glsl"
   fs <- MaybeT $ loadAndCompileShader GL_FRAGMENT_SHADER "data/fragmentShader.glsl"
 
-  programID <- glCreateProgram
-  glAttachShader programID vs
-  glAttachShader programID fs
-  glLinkProgram  programID
-  linkStatus <- fillWith $ glGetProgramiv programID GL_LINK_STATUS
+  programID <- createProgram
+  attachShader programID vs
+  attachShader programID fs
+  linkProgram  programID
+  linkStatus <- getProgramiv programID GL_LINK_STATUS
 
   when (linkStatus == GL_FALSE) . MaybeT $ do
-    infoLogLength <- fillWith $ glGetProgramiv programID GL_INFO_LOG_LENGTH
-
-    let infoLogLength' = fromIntegral infoLogLength
-    allocaBytes infoLogLength' $ \infoBuffer -> do
-      glGetProgramInfoLog programID infoLogLength nullPtr infoBuffer
-
-      T.putStr =<< T.peekCStringLen (infoBuffer, infoLogLength')
+    infoLogLength <- getProgramiv programID GL_INFO_LOG_LENGTH
+    getProgramInfoLog programID infoLogLength nullPtr (T.putStr <=< T.peekCStringLen)
 
     return Nothing
 
-  glDeleteShader vs
-  glDeleteShader fs
+  deleteShader vs
+  deleteShader fs
 
   let unsign :: Integral a => GLint -> Maybe a
       unsign x
@@ -412,21 +415,21 @@ initialise = runMaybeT $ do
         loc <- liftIO $ f programID str
         MaybeT . return $ unsign loc
 
-  glShader <- MaybeT . evalContT . runMaybeT $ Shader
+  shader <- MaybeT . evalContT . runMaybeT $ Shader
     <$> pure programID
-    <*> glGetAttribLocation `forString` "position"
-    <*> glGetAttribLocation `forString` "colour"
-    <*> glGetAttribLocation `forString` "normal"
-    <*> glGetAttribLocation `forString` "uv"
-    <*> glGetUniformLocation `forString` "pvmMatrix"
-    <*> glGetUniformLocation `forString` "viewModelMatrix"
-    <*> glGetUniformLocation `forString` "normalMatrix"
-    <*> glGetUniformLocation `forString` "diffuseColour"
-    <*> glGetUniformLocation `forString` "ambientColour"
-    <*> glGetUniformLocation `forString` "specularColour"
-    <*> glGetUniformLocation `forString` "shininess"
-    <*> glGetUniformLocation `forString` "lightDirection"
-    <*> glGetUniformLocation `forString` "diffuseMap"
+    <*> getAttribLocation `forString` "position"
+    <*> getAttribLocation `forString` "colour"
+    <*> getAttribLocation `forString` "normal"
+    <*> getAttribLocation `forString` "uv"
+    <*> getUniformLocation `forString` "pvmMatrix"
+    <*> getUniformLocation `forString` "viewModelMatrix"
+    <*> getUniformLocation `forString` "normalMatrix"
+    <*> getUniformLocation `forString` "diffuseColour"
+    <*> getUniformLocation `forString` "ambientColour"
+    <*> getUniformLocation `forString` "specularColour"
+    <*> getUniformLocation `forString` "shininess"
+    <*> getUniformLocation `forString` "lightDirection"
+    <*> getUniformLocation `forString` "diffuseMap"
 
   let cube = fromMeshSpec $ cuboid 1 1 1
 
@@ -434,58 +437,61 @@ initialise = runMaybeT $ do
     glGenBuffers 2 buffers
     peekArray 2 buffers
 
-  glBindBuffer GL_ARRAY_BUFFER vbo
+  bindBuffer GL_ARRAY_BUFFER vbo
   let vertices = _vertexData cube
   let vertexBufSize   = sizeOf (V.head vertices) * V.length vertices
   liftIO . SV.unsafeWith (SV.convert vertices) $ \vsPtr ->
-    glBufferData GL_ARRAY_BUFFER (fromIntegral vertexBufSize) (castPtr vsPtr) GL_STATIC_DRAW
+    bufferData GL_ARRAY_BUFFER (fromIntegral vertexBufSize) (castPtr vsPtr) GL_STATIC_DRAW
 
-  glBindBuffer GL_ARRAY_BUFFER 0
+  bindBuffer GL_ARRAY_BUFFER 0
 
-  glBindBuffer GL_ELEMENT_ARRAY_BUFFER ibo
+  bindBuffer GL_ELEMENT_ARRAY_BUFFER ibo
   let indices = _indexData cube
   let indexBufSize   = sizeOf (V.head indices) * V.length indices
   liftIO . SV.unsafeWith (SV.convert indices) $ \isPtr ->
-    glBufferData GL_ELEMENT_ARRAY_BUFFER (fromIntegral indexBufSize) (castPtr isPtr) GL_STATIC_DRAW
-  glBindBuffer GL_ELEMENT_ARRAY_BUFFER 0
+    bufferData GL_ELEMENT_ARRAY_BUFFER (fromIntegral indexBufSize) (castPtr isPtr) GL_STATIC_DRAW
+  bindBuffer GL_ELEMENT_ARRAY_BUFFER 0
 
-  vao <- liftIO . alloca $ \vaoPtr -> do
-    glGenVertexArrays 1 vaoPtr
-    peek vaoPtr
-  glBindVertexArray vao
+  vao <- peekAlloc (glGenVertexArrays 1)
+  bindVertexArray vao
 
-  glBindBuffer GL_ARRAY_BUFFER vbo
-  glBindBuffer GL_ELEMENT_ARRAY_BUFFER ibo
+  bindBuffer GL_ARRAY_BUFFER vbo
+  bindBuffer GL_ELEMENT_ARRAY_BUFFER ibo
 
-  glEnableVertexAttribArray (_positions glShader)
-  glEnableVertexAttribArray (_colors glShader)
-  glEnableVertexAttribArray (_normals glShader)
-  glEnableVertexAttribArray (_uvs glShader)
+  enableVertexAttribArray (_positions shader)
+  enableVertexAttribArray (_colors shader)
+  enableVertexAttribArray (_normals shader)
+  enableVertexAttribArray (_uvs shader)
 
   let floatSize = sizeOf (undefined :: GLfloat)
   let offset x = wordPtrToPtr $ x * fromIntegral floatSize
   let stride = fromIntegral floatSize * 11
 
-  glVertexAttribPointer (_positions glShader) 3 GL_FLOAT GL_FALSE stride (offset 0)
-  glVertexAttribPointer (_colors glShader) 3 GL_FLOAT GL_FALSE stride (offset 3)
-  glVertexAttribPointer (_normals glShader) 3 GL_FLOAT GL_FALSE stride (offset 6)
-  glVertexAttribPointer (_uvs glShader) 2 GL_FLOAT GL_FALSE stride (offset 9)
+  vertexAttribPointer (_positions shader) 3 GL_FLOAT GL_FALSE stride (offset 0)
+  vertexAttribPointer (_colors shader) 3 GL_FLOAT GL_FALSE stride (offset 3)
+  vertexAttribPointer (_normals shader) 3 GL_FLOAT GL_FALSE stride (offset 6)
+  vertexAttribPointer (_uvs shader) 2 GL_FLOAT GL_FALSE stride (offset 9)
 
-  let glMesh = Mesh vbo ibo vao (fromIntegral $ V.length indices)
+  let mesh = Mesh vbo ibo vao (fromIntegral $ V.length indices)
 
-  liftIO initGL >> return (Resources glMesh textureID glShader)
+  liftIO initGL
+  return Resources
+    { _mesh = mesh
+    , _texture = textureID
+    , _shader = shader
+    }
 
 initGL :: IO ()
 initGL = do
-  glClearColor 0.96 0.96 0.96 1
-  glClearDepth 1
-  glEnable GL_DEPTH_TEST
-  glDepthFunc GL_LEQUAL
-  glCullFace GL_BACK
+  clearColor 0.96 0.96 0.96 1
+  clearDepth 1
+  enable GL_DEPTH_TEST
+  depthFunc GL_LEQUAL
+  cullFace GL_BACK
 
 resize :: IORef (M44 GLfloat) -> Int -> Int -> IO ()
 resize projectionMatrix w h = do
-  glViewport 0 0 (fromIntegral w) (fromIntegral h)
+  viewport 0 0 (fromIntegral w) (fromIntegral h)
   writeIORef projectionMatrix $ calculateProjectionMatrix (w, h)
 
 calculateProjectionMatrix :: Integral a => (a, a) -> M44 GLfloat
@@ -494,8 +500,8 @@ calculateProjectionMatrix (w, h) =
 
 defaultState :: DemoState
 defaultState = DemoState
-  { _cubeRotation     =   axisAngle (V3 0 1 0) 0
-  , _cameraPosition   =   V3 0 1 (-2)
+  { _cubeRotation = axisAngle (V3 0 1 0) 0
+  , _cameraPosition = V3 0 1 (-2)
   }
 
 update :: DemoState -> GLfloat -> DemoState
@@ -504,9 +510,8 @@ update s dt = s { _cubeRotation = cubeRotatedBy (rotationSpeed * dt) }
     cubeRotatedBy θ = _cubeRotation s * axisAngle (V3 0 1 0) θ
     rotationSpeed = pi / 2
 
-runDemo :: IORef Bool ->   IORef (M44 GLfloat) -> IO () -> Maybe Resources -> IO ()
-runDemo _ _ _ Nothing = return ()
-runDemo closed projectionMatrix swapBuffers (Just res) = do
+runDemo :: IORef Bool ->   IORef (M44 GLfloat) -> IO () -> Resources -> IO ()
+runDemo closed projectionMatrix swapBuffers res = do
   loop defaultState
   cleanup res
   where
@@ -518,7 +523,7 @@ runDemo closed projectionMatrix swapBuffers (Just res) = do
     runFrame :: DemoState -> IO ()
     runFrame s = do
       draw res s =<< readIORef projectionMatrix
-      glFlush >> swapBuffers
+      flush >> swapBuffers
       dt <- getDeltaTime
       loop $ update s dt
 
@@ -532,32 +537,133 @@ draw res state projectionMatrix = do
   let inverseMat = Just $ inv33 viewModelMat33
   let normalMat = maybe identity distribute inverseMat
 
-  glClear (GL_COLOR_BUFFER_BIT .|. GL_DEPTH_BUFFER_BIT)
+  clear (GL_COLOR_BUFFER_BIT .|. GL_DEPTH_BUFFER_BIT)
 
-  glUseProgram . _shaderProgram $ _shader res
-  glBindVertexArray . _meshVAO $ _mesh res
-  glActiveTexture GL_TEXTURE0
-  glBindTexture GL_TEXTURE_2D $ _texture res
+  useProgram (_shaderProgram (_shader res))
+  bindVertexArray (_meshVAO (_mesh res))
+  activeTexture GL_TEXTURE0
+  bindTexture GL_TEXTURE_2D (_texture res)
 
-  with pvmMat $ glUniformMatrix4fv (_pvmMatrix $ _shader res) 1 GL_TRUE . castPtr
+  uniformMatrix4fv pvmMat (_pvmMatrix (_shader res)) 1 GL_TRUE
+  uniformMatrix4fv viewModelMat (_viewModelMatrix (_shader res)) 1 GL_TRUE
+  uniformMatrix3fv normalMat (_normalMatrix (_shader res)) 1 GL_TRUE
 
-  with viewModelMat $ glUniformMatrix4fv (_viewModelMatrix $ _shader res) 1 GL_TRUE . castPtr
+  uniform4f (_diffuseColour $ _shader res) 0.6 0.6 0.6 1
+  uniform4f (_ambientColour $ _shader res) 0.1 0.1 0.1 1
+  uniform4f (_specularColour $ _shader res) 0.7 0.7 0.7 1
+  uniform1f (_shininess $ _shader res) 0.4
+  uniform3f (_lightDirection $ _shader res) 0 0 1
+  uniform1i (_diffuseMap $ _shader res) 0
 
-  with normalMat $ glUniformMatrix3fv (_normalMatrix $ _shader res) 1 GL_TRUE . castPtr
-
-  glUniform4f (_diffuseColour $ _shader res) 0.6 0.6 0.6 1
-  glUniform4f (_ambientColour $ _shader res) 0.1 0.1 0.1 1
-  glUniform4f (_specularColour $ _shader res) 0.7 0.7 0.7 1
-  glUniform1f (_shininess $ _shader res) 0.4
-  glUniform3f (_lightDirection $ _shader res) 0 0 1
-  glUniform1i (_diffuseMap $ _shader res)0
-
-  glDrawElements GL_TRIANGLES (_meshIndexCount $ _mesh res) GL_UNSIGNED_INT (wordPtrToPtr 0)
+  drawElements GL_TRIANGLES (_meshIndexCount $ _mesh res) GL_UNSIGNED_INT (wordPtrToPtr 0)
 
 cleanup :: Resources -> IO ()
 cleanup (Resources m t s) = do
-  with (_meshVAO m) (glDeleteVertexArrays 1)
-  with (_meshVBO m) (glDeleteBuffers 1)
-  with (_meshIBO m) (glDeleteBuffers 1)
-  with t (glDeleteTextures 1)
-  glDeleteProgram (_shaderProgram s)
+  deleteVertexArrays 1 (_meshVAO m)
+  deleteBuffers 1 (_meshVBO m)
+  deleteBuffers 1 (_meshIBO m)
+  deleteTextures 1 t
+  deleteProgram (_shaderProgram s)
+
+-- GL wrappers
+
+clear :: GLbitfield -> IO ()
+clear = glClear
+
+useProgram :: GLuint -> IO ()
+useProgram = glUseProgram
+
+bindVertexArray :: MonadIO m => GLuint -> m ()
+bindVertexArray = glBindVertexArray
+
+activeTexture :: GLenum -> IO ()
+activeTexture = glActiveTexture
+
+uniformMatrix4fv :: M44 GLfloat -> GLint -> GLsizei -> GLboolean -> IO ()
+uniformMatrix4fv mat matLoc count transpose = with mat $ glUniformMatrix4fv matLoc count transpose . castPtr
+
+uniformMatrix3fv :: M33 GLfloat -> GLint -> GLsizei -> GLboolean -> IO ()
+uniformMatrix3fv mat matLoc count transpose = with mat $ glUniformMatrix4fv matLoc count transpose . castPtr
+
+getError = glGetError
+
+bindTexture :: MonadIO m => GLenum -> GLuint -> m ()
+bindTexture = glBindTexture
+
+createProgram = glCreateProgram
+
+attachShader = glAttachShader
+
+linkProgram = glLinkProgram
+
+getProgramiv programId params = fillWith (glGetProgramiv programId params)
+
+uniform1i = glUniform1i
+
+uniform1f = glUniform1f
+
+uniform3f = glUniform3f
+
+uniform4f = glUniform4f
+
+drawElements = glDrawElements
+
+deleteVertexArrays count val = with val (glDeleteVertexArrays count)
+
+deleteBuffers count val = with val (glDeleteBuffers count)
+
+deleteTextures count val =  with val (glDeleteTextures count)
+
+deleteProgram = glDeleteProgram
+
+texImage2D = glTexImage2D
+
+texParameteri = glTexParameteri
+
+createShader = glCreateShader
+
+shaderSource = glShaderSource
+
+compileShader = glCompileShader
+
+getShaderiv shaderId compileStatus = fillWith $ glGetShaderiv shaderId compileStatus
+
+getShaderInfoLog shaderId logLength ptr f = allocaBytes logLength' $ \buffer -> do
+  glGetShaderInfoLog shaderId logLength ptr buffer
+  f (buffer, logLength')
+  where
+    logLength' = fromIntegral logLength
+
+getProgramInfoLog programId logLength ptr f = allocaBytes logLength' $ \buffer -> do
+  glGetProgramInfoLog programId logLength ptr buffer
+  f (buffer, logLength')
+  where
+    logLength' = fromIntegral logLength
+
+deleteShader = glDeleteShader
+
+getAttribLocation = glGetAttribLocation
+
+getUniformLocation = glGetUniformLocation
+
+bindBuffer = glBindBuffer
+
+bufferData = glBufferData
+
+enableVertexAttribArray = glEnableVertexAttribArray
+
+vertexAttribPointer = glVertexAttribPointer
+
+clearColor = glClearColor
+
+clearDepth = glClearDepth
+
+enable = glEnable
+
+depthFunc = glDepthFunc
+
+cullFace = glCullFace
+
+flush = glFlush
+
+viewport = glViewport
